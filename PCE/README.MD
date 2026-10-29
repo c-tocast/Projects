@@ -161,6 +161,130 @@ vector_store = QdrantVectorStore(
 )
 ```
 ### 4. Búsqueda con metadatos estructurados
-Generar un `query_prompt =` con el fin de evitar traer axiomas incorrectos aplicando filtros explícitos además del vector, y generar `Reglas_validas = vector_store.similarity_search(` para que el contexto recuperado se inyecte en el modelo de razonamiento, el cual procesará la cadena de pensamiento (Thinking) antes de dar el output formal. Las skills .md deberán estar fragmentadas y vectorizadas guardando metadatos estructurados (como dominio, tipo_regla, o cuantificador)
+Generar un `query_prompt =` con el fin de evitar traer axiomas incorrectos aplicando filtros explícitos además del vector, y generar `Reglas_validas = vector_store.similarity_search(` para que el contexto recuperado se inyecte en el modelo de razonamiento, el cual procesará la cadena de pensamiento (Thinking) antes de dar el output formal. Las skills .md deberán estar fragmentadas y vectorizadas guardando metadatos estructurados (como dominio, tipo_regla, o cuantificador).
+
+# Configuraciones adicionales
+
+## Qdrant. 
+`https://qdrant.tech/documentation/quickstart/` Para crear el environment, se debe instalar Docker primero, por requerimiento de Qdrant. https://translate.google.com/translate?u=https://apps.microsoft.com/detail/xp8cbj40xlbwkx&hl=es&sl=en&tl=es&client=srp
+Desde ahi correr `docker pull qdrant/qdrant` Luego 
+
+```
+docker run -p 6333:6333 -p 6334:6334 \
+    -v "$(pwd)/qdrant_storage:/qdrant/storage:z" \
+    qdrant/qdrant
+```
+Esto va a guardar en `./qdrant_storage` toda la información. Y queda tal que así: 
+
+```
+REST API: localhost:6333
+Web UI: localhost:6333/dashboard
+GRPC API: localhost:6334
+```
+
+**1. Para iniciar el cliente**
+
+```
+from qdrant_client import QdrantClient
+
+client = QdrantClient(url="http://localhost:6333")
+```
+Por default Qdrant inicia sin credenciales, lo que es una implicación de seguridad.
+
+**2. Security Fix**
+
+Revisar en detalle `https://qdrant.tech/documentation/security/` para incluir autenticación por medio de API o Tokens.
+
+**3. Crear una colección**
+
+Python:
+```
+from qdrant_client.models import Distance, VectorParams
+
+client.create_collection(
+    collection_name="Nombre",
+    vectors_config=VectorParams(size=4, distance=Distance.DOT),
+)
+```
+Hay que revisar en detalle como configurar los parametros del vector y su distancia. Ajustar `(size=4, distance=Distance.DOT)`
+
+**4. Agregar vectores con su payload**
+Los vectores son una secuencia ordenada de números (una lista o array) que representa el significado, las características o el contenido de un objeto (como un texto, una imagen o un audio) en un espacio matemático de alta dimensionalidad, el payload es con lo que se va a contrastar.
+
+Para llevar al cabo el desarrollo de este proyecto, la conversión de los archivos .md (incluyendo la lógica del framework de referencia) se debe acoplar a Qdrant mediante jerarquización o chunking.
+Al tratarse de lógica formal, hacer un chunking por párrafos tradicionales puede romper fórmulas o premisas.
+
+El chunking basado en bloques lógicos y encabezados Markdown es la arquitectura seleccionada para este proyecto, puesto que demuestra eficiencia en sistemas RAG orientados a código, lógica de predicados y ejecución de "skills" (agentes), pero introduce desafíos técnicos en la generación de embeddings.
+
+**Asimetría en la Longitud de los Chunks:** Un bloque bajo un ### puede tener 50 tokens y otro bajo un ## puede tener 1500 tokens. Esta asimetría afecta el espacio latente: los chunks muy largos "diluyen" la representación vectorial del embedding (BGE-Small), haciendo que la búsqueda por similitud exacta sea menos precisa frente a un bloque corto y denso.
+**Riesgo de Truncamiento o "Lost in the Middle":** Si un bloque lógico es demasiado extenso y lo inyectas en el prompt, modelos pequeños o fuertemente cuantizados pueden ignorar instrucciones en el medio del bloque, especialmente cuando operas con un presupuesto de tokens estricto.
+**Complejidad de Ingesta:** No puedes usar un simple `RecursiveCharacterTextSplitter`. Requiere un pipeline de preprocesamiento personalizado para separar el YAML, aislar los bloques de código y dividir jerárquicamente por encabezados sin perder el contexto del documento original.
+
+Dado el formato de las skills.md, la mejor aproximación es utilizar el `MarkdownHeaderTextSplitter` de `LangChain` combinado con un extractor de frontmatter YAML y atacar tres frentes: la asimetría vectorial, el riesgo de truncamiento y la complejidad del pipeline de ingesta.
+
+# 1. Mitigación de la Asimetría y Dilución Vectorial / Parent-Child / Small-to-Big Retrieval
+
+· El script de ingesta divide el archivo .md en pedazos pequeños y granulares (hijos), por ejemplo, de 100 a 200 tokens (párrafos individuales, listas de viñetas o fragmentos de código), y son estos hijos los que se vectorizan y se guardan en Qdrant.
+· Cada hijo guarda en sus metadatos un identificador único del bloque superior (el padre, que es el encabezado ## o # completo).
+· Cuando el usuario hace una consulta, Qdrant busca y hace match con el fragmento hijo. Sin embargo, en lugar de inyectar solo el hijo al LLM, el script recupera y le entrega al modelo el bloque padre completo.
+
+# 2. Mitigar el Riesgo de Truncamiento
+
+· Antes de enviar el prompt a LM Studio, calcular el tamaño exacto del contexto recuperado usando el tokenizador nativo del modelo (p. ej., el tokenizer de Qwen). Limitar la recuperación en Qdrant a un tope estricto (ej. k=2 bloques padres máximo, equivalente a ~1,500 - 2,000 tokens), dejando al menos 4,000 tokens libres para que el modelo ejecute su cadena de pensamiento (Chain-of-Thought) sin quedarse sin espacio.
+· Obligar al modelo a operar dentro de bloques cerrados mediante system prompts estructurales usando XML:
+
+```
+<contexto_autoritativo>
+{contexto_padre_recuperado}
+</contexto_autoritativo>
+```
+· Configurar el cliente de inferencia con un max_tokens prudente (ej. 2048 o 4096) para evitar bucles infinitos de generación que fuercen un corte abrupto por hardware.
+
+# 3. Simplificar la Complejidad de Ingesta (ETL)
+
+· Usar la librería python-frontmatter para extraer el YAML.
+· Usar el RecursiveCharacterTextSplitter de LangChain configurado para respetar separadores de Markdown (\n## , \n### , \n\n).
+
+```
+import frontmatter
+from langchain.text_splitter import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
+from langchain.schema import Document
+
+def procesar_skill_md(ruta_archivo):
+    # 1. Leer archivo y separar Frontmatter con python-frontmatter
+    with open(ruta_archivo, 'r', encoding='utf-8') as f:
+        post = frontmatter.load(f)
+    
+    yaml_meta = post.metadata  # name, category, risk, etc.
+    contenido_markdown = post.content
+
+    # 2. Primer corte jerárquico por encabezados
+    headers_to_split = [
+        ("#", "Header_1"),
+        ("##", "Header_2"),
+        ("###", "Header_3"),
+    ]
+    markdown_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=headers_to_split)
+    parent_docs = markdown_splitter.split_text(contenido_markdown)
+
+    # 3. Segundo corte (hijos) para asegurar que ningún chunk supere los 250 tokens (Probar y cambiar si se necesita)
+    child_splitter = RecursiveCharacterTextSplitter(chunk_size=300, chunk_overlap=50)
+    
+    docs_para_qdrant = []
+    for parent in parent_docs:
+        # Asignar metadatos del YAML a cada nodo padre
+        parent.metadata.update(yaml_meta)
+        
+        # Generar hijos si el bloque es muy largo
+        hijos = child_splitter.split_documents([parent])
+        for hijo in hijos:
+            # Vincular el contenido del padre como referencia o metadato si se requiere
+            docs_para_qdrant.append(hijo)
+            
+    return docs_para_qdrant
+
+# El resultado debe ser una lista limpia de objetos Document para vectorizar en Qdrant sin errores de parsing.
+```
+
 
 
